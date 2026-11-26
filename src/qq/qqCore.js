@@ -1,4 +1,4 @@
-// QQ 橋接（QQ 開放平台官方機器人，單聊）。
+// QQ 橋接（QQ 開放平台官方機器人，單聊 + NapCat 直連兼容）。
 // 流程和 iMessage 一樣是「平台把訊息推到中繼網址 → 攢一會兒 → 回覆」，所以沿用 ImessageBridgeCore 的
 // 排隊 / 連發合併 / 收媒體 / 公開檔案，只換掉 QQ 特有的：
 //   - 設定：AppID + AppSecret（中繼換 access_token 驗證），回調網址讓用戶貼到 QQ 開放平台
@@ -221,13 +221,33 @@ export class QqBridgeCore extends ImessageBridgeCore {
         if (!acc || token !== acc.hookToken) return { status: 404, json: { error: 'not found' } };
         let body;
         try { body = JSON.parse(raw); } catch { return { status: 400, json: { error: 'invalid json' } }; }
-        // 回調地址驗證：用 Bot Secret 簽 event_ts + plain_token
-        if (body?.op === 13) {
-            await this.s.put('acc', { ...acc, verifiedAt: now() });
-            return { json: await qqValidationReply(acc.appSecret, body.d) };
+
+        // 直接兼容 NapCat (OneBot v11) HTTP 上報，免去 Ed25519 簽名校驗並透過快速操作回傳綁定結果
+        const isNapCat = Boolean(body?.post_type);
+        if (isNapCat) {
+            if (body.post_type !== 'message' || body.message_type !== 'private') return { json: {} };
+            const rawText = String(body.raw_message ?? (typeof body.message === 'string' ? body.message : '')).trim();
+            body = {
+                op: 0,
+                t: 'C2C_MESSAGE_CREATE',
+                d: {
+                    id: String(body.message_id || Date.now()),
+                    content: rawText,
+                    timestamp: new Date((body.time || Date.now() / 1000) * 1000).toISOString(),
+                    author: { id: String(body.user_id || ''), user_openid: String(body.user_id || '') },
+                    attachments: [],
+                },
+            };
+        } else {
+            // 回調地址驗證：用 Bot Secret 簽 event_ts + plain_token
+            if (body?.op === 13) {
+                await this.s.put('acc', { ...acc, verifiedAt: now() });
+                return { json: await qqValidationReply(acc.appSecret, body.d) };
+            }
+            if (!(await qqVerify(acc.appSecret, headers, raw))) return { status: 401, json: { error: 'bad signature' } };
         }
-        if (!(await qqVerify(acc.appSecret, headers, raw))) return { status: 401, json: { error: 'bad signature' } };
-        const ack = { json: { op: 12 } };
+
+        const ack = isNapCat ? { json: {} } : { json: { op: 12 } };
         if (body?.op !== 0 || body?.t !== 'C2C_MESSAGE_CREATE') return ack;
         const m = parseC2c(body.d);
         if (!m.openid) return ack;
@@ -238,6 +258,9 @@ export class QqBridgeCore extends ImessageBridgeCore {
             const next = { ...acc, userOpenid: m.openid, bindCode: '' };
             await this.s.put('acc', next);
             await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
+            if (isNapCat) {
+                return { json: { reply: '绑定成功。现在可以直接和角色聊天了，发「/切换」换角色。' } };
+            }
             await this._chanFor(next).sendText('绑定成功。现在可以直接和角色聊天了，发「/切换」换角色。').catch((e) => { this.lastWarn = { at: now(), text: `QQ 发送失败：${e?.message || e}` }; });
             return ack;
         }
