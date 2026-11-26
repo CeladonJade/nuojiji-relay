@@ -6,6 +6,7 @@ import { createApp } from './src/app.js';
 import { runProactiveTick, shouldRunTickNow } from './src/proactive/tick.js';
 import { runMomentsTick } from './src/moments/momentsTick.js';
 import { runJobsTick } from './src/jobs/jobsTick.js';
+import napcatAdapter from './napcat-adapter.js';
 
 // 微信橋接的 Durable Object 類（wrangler.toml 的 [[durable_objects.bindings]] 指向它）
 export { WechatBridge } from './src/wechat/wechatDO.js';
@@ -13,7 +14,18 @@ export { WechatBridge } from './src/wechat/wechatDO.js';
 const app = createApp();
 
 export default {
-    fetch: app.fetch,
+    async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        if (
+            url.pathname.startsWith('/napcat') ||
+            request.headers.get('x-self-id') ||
+            (request.headers.get('user-agent') || '').toLowerCase().includes('napcat') ||
+            (request.headers.get('user-agent') || '').toLowerCase().includes('onebot')
+        ) {
+            return napcatAdapter.fetch(request, env, ctx);
+        }
+        return app.fetch(request, env, ctx);
+    },
     // Phase 2：定时主动生成。wrangler.toml [triggers] crons 配置触发频率。
     async scheduled(event, env, ctx) {
         // 检测间隔（App 设置 / PROACTIVE_TICK_MINUTES，默认 5 分钟）没到就直接返回（省 KV 额度）。
