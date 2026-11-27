@@ -3,7 +3,7 @@
 //   /imessage/*              iMessage 管理介面（要中繼密鑰）
 //   /imessage/hook/:i/:t     iMessage 平台的 webhook（公開；網址裡的隨機 token 驗證，Linq / Blooio 另驗簽章）
 //   /imessage/pub/:i/:t/:id  合成語音的公開網址（平台要能直接抓；同一個 token）
-//   /qq/*、/qq/hook、/qq/pub QQ 官方機器人（同上；webhook 另驗 Ed25519 簽名）
+//   /qq/*、/qq/hook、/qq/pub QQ 官方機器人 / NapCat（支持 HTTP POST 與反向 WebSocket 直連）
 //   Workers：轉給該 inbox 的 Durable Object（env.WECHAT；iMessage 用另一個名稱的實例）
 //   Node：直接呼叫進程內的核心
 
@@ -68,6 +68,16 @@ function registerManaged(app, kind) {
 export function registerWechatRoutes(app) {
     // ---- iMessage / QQ 公開端點（必須註冊在密鑰中介層之前）----
     for (const kind of ['imessage', 'qq']) {
+        app.get(`/${kind}/hook/:inbox/:token`, async (c) => {
+            const inboxId = c.req.param('inbox');
+            const token = c.req.param('token');
+            if (c.req.header('upgrade')?.toLowerCase() === 'websocket' && hasDO(c.env)) {
+                return stubFor(c.env, kind, inboxId).fetch(
+                    new Request(`https://chat-bridge/${kind}/hook?${new URLSearchParams({ token, inboxId })}`, c.req.raw),
+                );
+            }
+            return c.json({ ok: true });
+        });
         app.post(`/${kind}/hook/:inbox/:token`, async (c) => {
             const inboxId = c.req.param('inbox');
             const token = c.req.param('token');

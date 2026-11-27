@@ -1,4 +1,4 @@
-// Cloudflare Workers：每個 inbox 每種渠道一個 Durable Object（微信橋接 / iMessage 橋接）。
+// Cloudflare Workers：每個 inbox 每種渠道一個 Durable Object（微信橋接 / iMessage 橋接 / QQ 橋接）。
 //
 // 為何用 Durable Object 而不是 cron：
 //   - 微信收訊息是長輪詢（一次掛 ~35s），要有一個常駐的單一持有者（同一 Bot 只能一個連線在拉）
@@ -57,7 +57,7 @@ export class WechatBridge {
                 else await state.storage.setAlarm(Date.now() + Math.max(0, ms));
             },
         };
-        // 同一個類承載兩種渠道（各自獨立的 DO 實例，名稱不同）：第一次被呼叫時記下是哪種
+        // 同一個類承載三種渠道（各自獨立的 DO 實例，名稱不同）：第一次被呼叫時記下是哪種
         this.storage = storage;
         this.cores = {
             wechat: () => (this._wx ||= new WechatBridgeCore(storage, env, hooks)),
@@ -78,7 +78,16 @@ export class WechatBridge {
         const kindHint = url.pathname.startsWith('/imessage') ? 'imessage' : url.pathname.startsWith('/qq') ? 'qq' : 'wechat';
         try {
             const core = await this._core(kindHint);
-            // iMessage 平台的 webhook（原始 body 要拿來驗簽）與公開音頻
+            if (query.inboxId) await core._rememberInbox(query.inboxId);
+            // NapCat 反向 WebSocket 長連接入口
+            if (url.pathname === '/qq/hook' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+                const pair = new WebSocketPair();
+                const [client, server] = Object.values(pair);
+                server.accept();
+                if (typeof core.attachWs === 'function') await core.attachWs(query.token, server);
+                return new Response(null, { status: 101, webSocket: client });
+            }
+            // iMessage / QQ 平台的 webhook（原始 body 要拿來驗簽）與公開音頻
             if (url.pathname === '/imessage/hook' || url.pathname === '/qq/hook') {
                 const raw = await request.text();
                 const r = await core.webhook(query.token, Object.fromEntries(request.headers), raw);
