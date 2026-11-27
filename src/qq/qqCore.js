@@ -1,4 +1,4 @@
-// QQ 橋接（支援 QQ 官方機器人 + NapCat / OneBot v11 直連單聊）
+// QQ 桥接（支持 QQ 官方机器人 + NapCat / OneBot v11 直连单聊）
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
 import { now } from '../chatbridge/baseCore.js';
 import { bytesToB64 } from '../wechat/ilinkClient.js';
@@ -30,12 +30,6 @@ function parseOneBot(body) {
     if (!text && typeof body?.message === 'string') {
         text = body.message.replace(/\[CQ:[^\]]+\]/g, '');
     }
-    if (!mediaUrls.length && typeof body?.raw_message === 'string') {
-        const matches = body.raw_message.matchAll(/\[CQ:(?:image|video|record)[^\]]*?,url=([^,\]]+)/g);
-        for (const m of matches) {
-            if (m[1]) mediaUrls.push(m[1].replace(/&amp;/g, '&'));
-        }
-    }
     const ts = (Number(body?.time) ? Number(body.time) * 1000 : 0) || Date.now();
     return { id, openid, text: text.trim(), voiceText: '', mediaUrls, ts };
 }
@@ -44,7 +38,6 @@ export class QqBridgeCore extends ImessageBridgeCore {
     constructor(storage, env, hooks) {
         super(storage, env, hooks, { prefix: '/qq', label: 'QQ', logPrefix: 'qq' });
         this._napcatCollector = [];
-        this._napcatLastAt = 0;
         this._napcatTurn = 0;
     }
 
@@ -121,3 +114,216 @@ export class QqBridgeCore extends ImessageBridgeCore {
     }
 
     async sendTest() {
+        const acc = await this.s.get('acc');
+        if (acc?.isNapcat && acc?.userOpenid) return { json: { ok: true } };
+        const opened = await this.openChannel();
+        if (!opened?.chan) return { status: 400, json: { ok: false, error: opened?.reason || 'not set up' } };
+        try {
+            await opened.chan.sendText('糯叽机已连接 QQ。直接回这条消息就能和角色聊天，发「/切换」换角色。');
+            return { json: { ok: true } };
+        } catch (e) {
+            return { status: 502, json: { ok: false, error: String(e?.message || e) } };
+        }
+    }
+
+    async _token(acc) {
+        const t = await this.s.get('qqToken');
+        if (t?.token && t.expiresAt - now() > 120000) return t.token;
+        try {
+            const fresh = await fetchAccessToken(acc.appId, acc.appSecret);
+            await this.s.put('qqToken', fresh);
+            return fresh.token;
+        } catch {
+            return 'napcat_local_token';
+        }
+    }
+
+    _chanFor(acc) {
+        const base = super._chanFor({ ...acc, provider: null });
+        const self = this;
+
+        if (acc.isNapcat) {
+            const pushNapcat = async (text) => {
+                if (!text) return { ok: true };
+                self._napcatCollector.push(String(text));
+                const httpUrl = self.env?.NAPCAT_HTTP_URL;
+                if (httpUrl && !/127\.0\.0\.1|localhost/i.test(httpUrl)) {
+                    const headers = { 'Content-Type': 'application/json' };
+                    if (self.env?.NAPCAT_TOKEN) headers['Authorization'] = `Bearer ${self.env.NAPCAT_TOKEN}`;
+                    await fetch(`${String(httpUrl).replace(/\/+$/, '')}/send_private_msg`, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ user_id: Number(acc.userOpenid) || acc.userOpenid, message: String(text) }),
+                    }).catch(() => {});
+                }
+                return { ok: true };
+            };
+            return {
+                budget: Infinity,
+                takeNew: base.takeNew,
+                sendText: (text) => pushNapcat(text),
+                sendSticker: async (url) => pushNapcat(`[CQ:image,file=${await self._mediaUrl(acc, url)}]`),
+                sendVideo: async (url) => pushNapcat(`[CQ:video,file=${await self._mediaUrl(acc, url)}]`),
+                sendVoice: async (mp3) => {
+                    const id = await self._putPublic(mp3, 'audio/mpeg', 'mp3');
+                    const u = self._pubUrl(acc, await self.s.get('inbox'), id);
+                    return pushNapcat(`[CQ:record,file=${u}]`);
+                },
+                typing: async () => {},
+            };
+        }
+
+        const path = `/v2/users/${encodeURIComponent(acc.userOpenid)}`;
+        async function send(body) {
+            const token = await self._token(acc);
+            const ctx = await self.s.get('qqReply');
+            if (ctx?.msgId && now() - ctx.at < PASSIVE_WINDOW_MS && (ctx.used || 0) < PASSIVE_MAX) {
+                const seq = (ctx.used || 0) + 1;
+                try {
+                    const r = await qqCall(token, 'POST', `${path}/messages`, { ...body, msg_id: ctx.msgId, msg_seq: seq });
+                    await self.s.put('qqReply', { ...ctx, used: seq });
+                    return r;
+                } catch (e) {
+                    if (!isPassiveExpired(e)) throw e;
+                    await self.s.put('qqReply', { ...ctx, used: PASSIVE_MAX });
+                }
+            }
+            return qqCall(token, 'POST', `${path}/messages`, { ...body, msg_seq: Math.floor(Math.random() * 1e6) + 1 });
+        }
+
+        async function upload(fileType, extra) {
+            const token = await self._token(acc);
+            const up = await qqCall(token, 'POST', `${path}/files`, { file_type: fileType, srv_send_msg: false, ...extra });
+            if (!up?.file_info) throw new Error('QQ upload: no file_info');
+            return up.file_info;
+        }
+
+        async function sendMedia(fileType, url, bytes) {
+            let fileInfo = null;
+            let firstErr = null;
+            if (bytes?.length) {
+                try { fileInfo = await upload(fileType, { file_data: bytesToB64(bytes) }); } catch (e) { firstErr = e; }
+            }
+            if (!fileInfo) {
+                try { fileInfo = await upload(fileType, { url }); } catch (e) { throw firstErr || e; }
+            }
+            return send({ msg_type: 7, media: { file_info: fileInfo } });
+        }
+
+        async function bytesOf(ref) {
+            const local = await self.loadSticker(ref);
+            if (local) return local.bytes;
+            if (!/^https?:\/\//i.test(String(ref || ''))) return null;
+            try {
+                const res = await fetch(ref);
+                if (!res.ok) return null;
+                const b = new Uint8Array(await res.arrayBuffer());
+                return b.length && b.length <= 20 * 1024 * 1024 ? b : null;
+            } catch { return null; }
+        }
+
+        return {
+            budget: Infinity,
+            takeNew: base.takeNew,
+            sendText: (text) => send({ msg_type: 0, content: text }),
+            sendSticker: async (url) => sendMedia(FileType.IMAGE, await self._mediaUrl(acc, url), await bytesOf(url)),
+            sendVideo: async (url) => sendMedia(FileType.VIDEO, await self._mediaUrl(acc, url), await bytesOf(url)),
+            async sendVoice(mp3, label) {
+                const id = await self._putPublic(mp3, 'audio/mpeg', 'mp3');
+                const url = self._pubUrl(acc, await self.s.get('inbox'), id);
+                try {
+                    await sendMedia(FileType.VOICE, url, mp3);
+                } catch {
+                    await sendMedia(FileType.FILE, `${url}?name=${encodeURIComponent(`${label || 'voice'}.mp3`)}`, mp3);
+                }
+            },
+            async typing(on) {
+                if (!on || this._typed) return;
+                this._typed = true;
+                try {
+                    const ctx = await self.s.get('qqReply');
+                    if (ctx?.msgId && now() - ctx.at < PASSIVE_WINDOW_MS && (ctx.used || 0) < PASSIVE_MAX - 1) {
+                        await send({ msg_type: 6, input_notify: { input_type: 1, input_second: 60 } });
+                    }
+                } catch {}
+            },
+        };
+    }
+
+    async openChannel() {
+        const acc = await this.s.get('acc');
+        if (!acc) return { reason: 'not set up' };
+        if (!acc.userOpenid) return { reason: 'not linked' };
+        return { chan: this._chanFor(acc) };
+    }
+
+    async webhook(token, headers, raw) {
+        const acc = await this.s.get('acc');
+        if (!acc || token !== acc.hookToken) return { status: 404, json: { error: 'not found' } };
+        let body;
+        try { body = JSON.parse(raw); } catch { return { status: 400, json: { error: 'invalid json' } }; }
+
+        if (body?.post_type) {
+            if (body.post_type !== 'message' || body.message_type !== 'private') return { json: {} };
+            const m = parseOneBot(body);
+            if (!m.openid) return { json: {} };
+
+            if (!acc.userOpenid) {
+                if (m.text.replace(/\s+/g, '') !== String(acc.bindCode || '').trim()) return { json: {} };
+                const next = { ...acc, userOpenid: m.openid, bindCode: '', isNapcat: true, verifiedAt: now() };
+                await this.s.put('acc', next);
+                await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
+                return { json: { reply: '绑定成功。现在可以直接和角色聊天了，发「/切换」换角色。' } };
+            }
+            if (m.openid !== acc.userOpenid) return { json: {} };
+            if (!acc.isNapcat) {
+                acc.isNapcat = true;
+                await this.s.put('acc', acc);
+            }
+
+            this._napcatCollector = [];
+            await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
+            await this._enqueue([m]);
+
+            if (!this._napcatCollector.length) {
+                const turn = ++this._napcatTurn;
+                await new Promise((r) => setTimeout(r, 2200));
+                if (turn === this._napcatTurn && !this._napcatCollector.length) {
+                    const fn = this.flush || this._flush || this.tick || this._tick || this.onAlarm || this.alarm;
+                    if (typeof fn === 'function') {
+                        try { await fn.call(this); } catch {}
+                    }
+                }
+            }
+            if (this._napcatCollector.length) {
+                const replyText = this._napcatCollector.splice(0).join('\n');
+                return { json: { reply: replyText, auto_escape: false } };
+            }
+            return { json: {} };
+        }
+
+        if (body?.op === 13) {
+            await this.s.put('acc', { ...acc, verifiedAt: now() });
+            return { json: await qqValidationReply(acc.appSecret, body.d) };
+        }
+        if (!(await qqVerify(acc.appSecret, headers, raw))) return { status: 401, json: { error: 'bad signature' } };
+        const ack = { json: { op: 12 } };
+        if (body?.op !== 0 || body?.t !== 'C2C_MESSAGE_CREATE') return ack;
+        const m = parseC2c(body.d);
+        if (!m.openid) return ack;
+
+        if (!acc.userOpenid) {
+            if (m.text.replace(/\s+/g, '') !== acc.bindCode) return ack;
+            const next = { ...acc, userOpenid: m.openid, bindCode: '' };
+            await this.s.put('acc', next);
+            await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
+            await this._chanFor(next).sendText('绑定成功。现在可以直接和角色聊天了，发「/切换」换角色。').catch((e) => { this.lastWarn = { at: now(), text: `QQ 发送失败：${e?.message || e}` }; });
+            return ack;
+        }
+        if (m.openid !== acc.userOpenid) return ack;
+
+        await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
+        await this._enqueue([m]);
+        return ack;
+    }
+}
