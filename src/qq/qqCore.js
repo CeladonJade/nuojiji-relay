@@ -1,4 +1,4 @@
-// QQ 桥接（支持 QQ 官方机器人 + NapCat / OneBot v11 直连单聊）
+// QQ 桥接（支持 QQ 官方机器人 + NapCat / OneBot v11 HTTP 与反向 WebSocket 直连单聊）
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
 import { now } from '../chatbridge/baseCore.js';
 import { bytesToB64 } from '../wechat/ilinkClient.js';
@@ -39,6 +39,53 @@ export class QqBridgeCore extends ImessageBridgeCore {
         super(storage, env, hooks, { prefix: '/qq', label: 'QQ', logPrefix: 'qq' });
         this._napcatCollector = [];
         this._napcatTurn = 0;
+        this._wsClients = new Set();
+    }
+
+    async attachWs(token, ws) {
+        const acc = await this.s.get('acc');
+        if (!acc || token !== acc.hookToken) {
+            try { ws.close(1008, 'invalid token'); } catch {}
+            return;
+        }
+        this._wsClients.add(ws);
+        ws.addEventListener('message', async (ev) => {
+            try {
+                const raw = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data);
+                const data = JSON.parse(raw);
+                if (!data?.post_type || data.post_type === 'meta_event') return;
+                const r = await this.webhook(token, {}, raw);
+                if (r?.json?.reply) {
+                    const uid = data?.user_id || data?.sender?.user_id || (await this.s.get('acc'))?.userOpenid;
+                    if (uid) this._sendWs(uid, r.json.reply);
+                }
+            } catch {}
+        });
+        const clean = () => this._wsClients.delete(ws);
+        ws.addEventListener('close', clean);
+        ws.addEventListener('error', clean);
+    }
+
+    _sendWs(userId, message) {
+        if (!this._wsClients || !this._wsClients.size || !userId || !message) return false;
+        const payload = JSON.stringify({
+            action: 'send_private_msg',
+            params: {
+                user_id: Number(userId) || userId,
+                message: String(message),
+            },
+            echo: `qq_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        });
+        let sent = false;
+        for (const ws of [...this._wsClients]) {
+            try {
+                ws.send(payload);
+                sent = true;
+            } catch {
+                this._wsClients.delete(ws);
+            }
+        }
+        return sent;
     }
 
     async handleChannel(method, path, query, body) {
@@ -115,7 +162,10 @@ export class QqBridgeCore extends ImessageBridgeCore {
 
     async sendTest() {
         const acc = await this.s.get('acc');
-        if (acc?.isNapcat && acc?.userOpenid) return { json: { ok: true } };
+        if (acc?.isNapcat && acc?.userOpenid) {
+            this._sendWs(acc.userOpenid, '糯叽机已连接 QQ。直接回这条消息就能和角色聊天，发「/切换」换角色。');
+            return { json: { ok: true } };
+        }
         const opened = await this.openChannel();
         if (!opened?.chan) return { status: 400, json: { ok: false, error: opened?.reason || 'not set up' } };
         try {
@@ -145,16 +195,19 @@ export class QqBridgeCore extends ImessageBridgeCore {
         if (acc.isNapcat) {
             const pushNapcat = async (text) => {
                 if (!text) return { ok: true };
-                self._napcatCollector.push(String(text));
-                const httpUrl = self.env?.NAPCAT_HTTP_URL;
-                if (httpUrl && !/127\.0\.0\.1|localhost/i.test(httpUrl)) {
-                    const headers = { 'Content-Type': 'application/json' };
-                    if (self.env?.NAPCAT_TOKEN) headers['Authorization'] = `Bearer ${self.env.NAPCAT_TOKEN}`;
-                    await fetch(`${String(httpUrl).replace(/\/+$/, '')}/send_private_msg`, {
-                        method: 'POST',
-                        headers,
-                        body: JSON.stringify({ user_id: Number(acc.userOpenid) || acc.userOpenid, message: String(text) }),
-                    }).catch(() => {});
+                const sentByWs = self._sendWs(acc.userOpenid, String(text));
+                if (!sentByWs) {
+                    self._napcatCollector.push(String(text));
+                    const httpUrl = self.env?.NAPCAT_HTTP_URL;
+                    if (httpUrl && !/127\.0\.0\.1|localhost/i.test(httpUrl)) {
+                        const headers = { 'Content-Type': 'application/json' };
+                        if (self.env?.NAPCAT_TOKEN) headers['Authorization'] = `Bearer ${self.env.NAPCAT_TOKEN}`;
+                        await fetch(`${String(httpUrl).replace(/\/+$/, '')}/send_private_msg`, {
+                            method: 'POST',
+                            headers,
+                            body: JSON.stringify({ user_id: Number(acc.userOpenid) || acc.userOpenid, message: String(text) }),
+                        }).catch(() => {});
+                    }
                 }
                 return { ok: true };
             };
@@ -285,14 +338,18 @@ export class QqBridgeCore extends ImessageBridgeCore {
             await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
             await this._enqueue([m]);
 
+            // 已連上反向 WebSocket 時交給後台排程器慢慢生成並逐條推送，不卡 webhook
+            if (this._wsClients && this._wsClients.size > 0) {
+                return { json: {} };
+            }
+
             if (!this._napcatCollector.length) {
                 const turn = ++this._napcatTurn;
                 await new Promise((r) => setTimeout(r, 2200));
                 if (turn === this._napcatTurn && !this._napcatCollector.length) {
-                    const fn = this.flush || this._flush || this.tick || this._tick || this.onAlarm || this.alarm;
-                    if (typeof fn === 'function') {
-                        try { await fn.call(this); } catch {}
-                    }
+                    await this.s.put('lastUserAt', 0);
+                    await this.s.put('pendingSince', 0);
+                    try { await this.runOnce(); } catch {}
                 }
             }
             if (this._napcatCollector.length) {
@@ -321,7 +378,6 @@ export class QqBridgeCore extends ImessageBridgeCore {
             return ack;
         }
         if (m.openid !== acc.userOpenid) return ack;
-
         await this.s.put('qqReply', { msgId: m.id, at: now(), used: 0 });
         await this._enqueue([m]);
         return ack;
